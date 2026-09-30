@@ -997,11 +997,12 @@ async function executeAutoStage(id){
   const atual = T(id);
   if (!atual) return {ok:false, mensagem:'A tarefa deixou de existir durante a execução.'};
   if (!result.ok || !result.text){
-    hist(atual, `${person(s.resp).name} não conseguiu concluir ${s.label}: ${result.mensagem || 'sem resultado'}.`, 'ia_erro', 'automacao');
+    const detalheErro = result.mensagem || (result.status ? `Erro HTTP ${result.status}` : 'sem resultado');
+    hist(atual, `${person(s.resp).name} não conseguiu concluir ${s.label}: ${detalheErro}.`, 'ia_erro', 'automacao');
     await Store.put('tasks', atual);
-    notify(`Problema em ${s.label}: ${atual.title}`, 'ia_erro', atual.id, null, ['gerente','secretaria']);
+    notify(`Problema em ${s.label}: ${detalheErro}`, 'ia_erro', atual.id, null, ['gerente','secretaria']);
     renderHUD(); syncAgents();
-    return result;
+    return {...result, mensagem: detalheErro};
   }
 
   const final = T(id); const sf = final && final.stages[final.cur];
