@@ -839,8 +839,8 @@ function nextCode(){
   return 'T-' + String(max + 1).padStart(4, '0');
 }
 function assignNote(t, s){ hist(t, `Etapa ${s.label} atribuída a ${person(s.resp).name} — aguardando início.`, 'atribuicao'); notify(`Etapa ${s.label} atribuída a ${person(s.resp).name}: ${t.title}`, 'atribuicao', t.id); }
-function createTask({title, desc, type, priority, due, notes, stages}){
-  const t = {id: uid(), code: nextCode(), title, desc, type, template: type, priority: priority || 'media', createdAt: now(), startedAt: null, doneAt: null, due: due || '', notes: notes || '',
+function createTask({title, desc, type, priority, due, notes, stages, auto}){
+  const t = {id: uid(), code: nextCode(), title, desc, type, template: type, priority: priority || 'media', createdAt: now(), startedAt: null, doneAt: null, due: due || '', notes: notes || '', auto: !!auto,
     hold: null, holdNote: '', cur: 0, stages: stages.map((s, i) => ({key: s.key, label: STAGES[s.key].label, resp: s.resp, status: i ? 'pendente' : 'aguardando', startedAt: null, doneAt: null})), history: []};
   hist(t, `Tarefa ${t.code} criada — ${typeLabel(type)}, prioridade ${PRIORITIES[t.priority][0].toLowerCase()}${t.due ? ', prazo ' + fmtDate(t.due) : ''}. Fluxo: ${t.stages.map(s => s.label).join(' → ')}.`, 'criacao');
   if (notes) hist(t, `Observação: ${notes}`, 'observacao');
@@ -859,13 +859,144 @@ function startStage(id){
 }
 
 const AI_AUTO_STAGES = new Set(['pesquisa','copy','roteiro','criativo','revisao','finalizacao','analise']);
-const AUTO_RUNNERS = new Set();
+const AUTO_RUNNERS = new Set();   // tarefas com o laço de automação rodando
+const STAGE_LOCKS = new Set();    // etapas (tarefa#índice#chave) com chamada à IA em curso — evita execução duplicada
 
+/* ---------- Saneamento das respostas da IA ---------- */
+/* Texto comum: remove BOM/caracteres invisíveis e, se a resposta inteira vier dentro de uma cerca Markdown, tira a cerca. */
 function cleanAIText(text){
-  let x = String(text || '').trim();
-  x = x.replace(/^```(?:svg|xml|html|text)?\s*/i, '').replace(/\s*```$/i, '').trim();
-  return x;
+  let x = String(text || '').replace(/^﻿/, '').replace(/[​‌‍⁠]/g, '').replace(/\r\n?/g, '\n').trim();
+  const whole = /^```[ \t]*[\w+-]*[^\n]*\n([\s\S]*?)\n?```\s*$/.exec(x);
+  if (whole) x = whole[1];
+  else x = x.replace(/^```[ \t]*(?:svg|xml|html|text|markdown|md)?[ \t]*\n/i, '').replace(/\n?```\s*$/, '');
+  return x.trim();
 }
+/* Resposta que é, na verdade, uma mensagem de erro (da API, do Worker ou do modelo) — nunca vira arquivo. Conservador: só textos curtos com padrão claro de erro técnico. */
+function looksLikeAIError(text){
+  const x = String(text || '').trim();
+  if (!x) return true;
+  if (x.length > 1200) return false;
+  if (/^\{[\s\S]*"(?:error|errors)"\s*:/i.test(x)) return true;
+  if (/^\[?\s*(?:GoogleGenerativeAI Error|Gemini API error|Worker error)/i.test(x)) return true;
+  if (/^(?:erro|error|falha|failed)\b[^\n]{0,60}\b(?:http|status|api|worker|gemini|timeout|tempo esgotado|quota|cota|rate.?limit|internal|unavailable|resource_exhausted|permission_denied|invalid_argument|deadline_exceeded)/i.test(x)) return true;
+  if (/^(?:internal server error|bad gateway|service unavailable|gateway timeout|too many requests)\b/i.test(x)) return true;
+  return false;
+}
+
+const SVG_NS = 'http://www.w3.org/2000/svg', XLINK_NS = 'http://www.w3.org/1999/xlink';
+const SVG_MAX_CHARS = 2000000;
+/* Isola UM elemento <svg> raiz (com seus <svg> aninhados) de uma resposta que pode ter Markdown, texto antes/depois ou vários SVGs. */
+function extractSVG(raw){
+  let x = String(raw || '').replace(/^﻿/, '').replace(/[​‌‍⁠]/g, '').replace(/\r\n?/g, '\n');
+  const fenced = [...x.matchAll(/```[ \t]*[\w+-]*[^\n]*\n([\s\S]*?)```/g)].map(m => m[1]).find(c => /<svg[\s>]/i.test(c));
+  if (fenced) x = fenced;
+  x = x.replace(/```[ \t]*[\w+-]*/g, '');           // cercas soltas (ex.: resposta truncada sem a cerca final)
+  const start = x.search(/<svg[\s>\/]/i);
+  if (start < 0) return {ok:false, motivo:'a resposta não contém um elemento <svg>'};
+  const rx = /<svg\b[^>]*>|<\/svg\s*>/gi; rx.lastIndex = start;
+  let depth = 0, end = -1, m;
+  while ((m = rx.exec(x))){
+    if (m[0][1] === '/') depth--;
+    else if (/\/\s*>$/.test(m[0])){ if (depth === 0){ end = rx.lastIndex; break; } continue; }   // <svg/> autofechado
+    else depth++;
+    if (depth === 0){ end = rx.lastIndex; break; }
+  }
+  if (end < 0) return {ok:false, motivo:'o SVG está incompleto (sem o </svg> final) — a resposta provavelmente foi truncada'};
+  return {ok:true, svg: x.slice(start, end).trim()};
+}
+/* Valida uma string SVG com o parser XML do navegador. */
+function validateSVGString(str){
+  const s = String(str || '').trim();
+  if (!s) return {ok:false, motivo:'SVG vazio'};
+  if (typeof DOMParser === 'undefined') return {ok:false, motivo:'validador de SVG indisponível neste navegador'};
+  let doc;
+  try { doc = new DOMParser().parseFromString(s, 'image/svg+xml'); } catch (e){ return {ok:false, motivo:'o navegador não conseguiu ler o SVG'}; }
+  const root = doc && doc.documentElement;
+  const perr = doc && (doc.getElementsByTagName('parsererror')[0] || (doc.getElementsByTagNameNS && doc.getElementsByTagNameNS('*', 'parsererror')[0]));
+  if (!root || perr || root.localName === 'parsererror'){
+    const det = perr ? String(perr.textContent || '').replace(/This page contains the following errors:|Below is a rendering of the page up to the first error\.?/gi, '').replace(/\s+/g, ' ').trim().slice(0, 180) : '';
+    return {ok:false, motivo:'XML inválido' + (det ? ` (${det})` : '')};
+  }
+  if (root.localName !== 'svg' || root.namespaceURI !== SVG_NS) return {ok:false, motivo:'o elemento raiz não é um <svg> com xmlns="http://www.w3.org/2000/svg"'};
+  return {ok:true, doc, root};
+}
+/* Entidades HTML (&nbsp;, &eacute;…) não existem em XML: converte para referência numérica; "&" solto vira &amp;. */
+function fixSVGEntities(s){
+  const XML_ENT = new Set(['amp','lt','gt','quot','apos']);
+  let dec = null;
+  return s.replace(/&([a-zA-Z][a-zA-Z0-9]*);/g, (m, name) => {
+    if (XML_ENT.has(name)) return m;
+    try {
+      dec = dec || document.createElement('textarea'); dec.innerHTML = m; const v = dec.value;
+      if (v && v !== m) return [...v].map(ch => `&#${ch.codePointAt(0)};`).join('');
+    } catch (e) {}
+    return '&amp;' + name + ';';
+  }).replace(/&(?!(?:[a-zA-Z][a-zA-Z0-9]*|#\d+|#x[0-9a-fA-F]+);)/g, '&amp;');
+}
+/* Pipeline completo: extrai → normaliza → valida (DOMParser) → limpa → serializa (XMLSerializer) → valida de novo. Nunca devolve SVG inválido. */
+function sanitizeSVG(raw){
+  const ex = extractSVG(raw); if (!ex.ok) return ex;
+  let src = ex.svg;
+  if (src.length > SVG_MAX_CHARS) return {ok:false, motivo:'o SVG é grande demais'};
+  src = src.replace(/^<svg\b([^>]*?)(\/?)>/i, (m, attrs, selfClose) => {
+    let a = attrs;
+    if (!/\sxmlns\s*=/.test(a)) a = ` xmlns="${SVG_NS}"` + a;
+    if (/xlink:/.test(src) && !/\sxmlns:xlink\s*=/.test(a)) a = ` xmlns:xlink="${XLINK_NS}"` + a;
+    return `<svg${a}${selfClose}>`;
+  });
+  src = fixSVGEntities(src);
+  const v1 = validateSVGString(src); if (!v1.ok) return v1;
+  const {doc, root} = v1;
+  // segurança: sem scripts, sem eventos, sem links javascript:
+  [...root.getElementsByTagNameNS('*', 'script')].forEach(n => n.remove());
+  [root, ...root.getElementsByTagName('*')].forEach(el => [...el.attributes].forEach(at => {
+    if (/^on/i.test(at.name) || (/(^|:)href$/i.test(at.name) && /^\s*javascript:/i.test(at.value))) el.removeAttributeNode(at);
+  }));
+  // precisa ter conteúdo visível
+  const drawable = [...root.getElementsByTagName('*')].some(el => !/^(title|desc|metadata|defs|style)$/i.test(el.localName) && !el.closest('defs'));
+  if (!drawable) return {ok:false, motivo:'o SVG não tem nenhum elemento visível'};
+  // dimensões: garantir viewBox e width/height
+  const num = v => { const m = /^\s*(\d+(?:\.\d+)?)\s*(px)?\s*$/.exec(v || ''); return m ? +m[1] : null; };
+  const vb = (root.getAttribute('viewBox') || '').trim().split(/[\s,]+/).map(Number);
+  const vbOk = vb.length === 4 && vb.every(n => isFinite(n)) && vb[2] > 0 && vb[3] > 0;
+  const w = num(root.getAttribute('width')), h = num(root.getAttribute('height'));
+  if (!vbOk){
+    if (w && h) root.setAttribute('viewBox', `0 0 ${w} ${h}`);
+    else { root.setAttribute('viewBox', '0 0 1080 1350'); if (!root.hasAttribute('width')) root.setAttribute('width', '1080'); if (!root.hasAttribute('height')) root.setAttribute('height', '1350'); }
+  } else if (!root.hasAttribute('width') && !root.hasAttribute('height')){ root.setAttribute('width', String(vb[2])); root.setAttribute('height', String(vb[3])); }
+  let out;
+  try { out = new XMLSerializer().serializeToString(doc.documentElement); } catch (e){ return {ok:false, motivo:'não foi possível serializar o SVG'}; }
+  if (!/^<svg[\s>]/.test(out) || !out.includes(`xmlns="${SVG_NS}"`)) out = out.replace(/^<svg\b/, `<svg xmlns="${SVG_NS}"`);
+  out = '<?xml version="1.0" encoding="UTF-8"?>\n' + out;
+  const v2 = validateSVGString(out);
+  if (!v2.ok) return {ok:false, motivo:'o SVG ficou inválido após a normalização: ' + v2.motivo};
+  return {ok:true, svg: out};
+}
+/* Transforma a resposta bruta da IA no conteúdo que será guardado — ou recusa, com o motivo. */
+function buildStageResult(rawText, needsSvg){
+  const raw = String(rawText || '');
+  if (!raw.trim()) return {ok:false, motivo:'a IA devolveu uma resposta vazia'};
+  if (looksLikeAIError(raw)) return {ok:false, motivo:`a IA devolveu uma mensagem de erro em vez do material ("${raw.trim().replace(/\s+/g, ' ').slice(0, 200)}")`};
+  if (needsSvg){ const s = sanitizeSVG(raw); return s.ok ? {ok:true, content:s.svg, isSvg:true} : {ok:false, motivo:'SVG inválido: ' + s.motivo}; }
+  const cleaned = cleanAIText(raw);
+  if (!cleaned) return {ok:false, motivo:'a resposta da IA ficou vazia depois da limpeza'};
+  if (/^(?:<\?xml[^>]*>\s*)?<svg[\s>]/i.test(cleaned)){ const s = sanitizeSVG(cleaned); if (s.ok) return {ok:true, content:s.svg, isSvg:true}; }
+  return {ok:true, content:cleaned, isSvg:false};   // texto com SVG inválido dentro é guardado como .txt, nunca como .svg
+}
+/* SVG válido mais recente da tarefa (base da Revisão quando o material principal é um criativo SVG). SVGs inválidos antigos são ignorados. */
+async function latestValidSVG(taskId){
+  const svgs = Store.all('files').filter(f => f.taskId === taskId && /\.svg$/i.test(f.name) && Store.available(f)).sort((a, b) => b.createdAt - a.createdAt);
+  for (const f of svgs){
+    try { const text = await (await Store.getBlob(f)).text(); if (validateSVGString(text).ok) return {file:f, text}; } catch (e) {}
+  }
+  return {file:null, text:''};
+}
+async function stageNeedsSVG(stageKey, taskId){
+  if (stageKey === 'criativo') return true;
+  if (stageKey === 'revisao') return !!(await latestValidSVG(taskId)).file;
+  return false;
+}
+const isAutoTask = t => !!t && (t.auto === true || /Execução automática ativada/i.test(t.notes || ''));
 
 function inferOrderType(order){
   const q = norm(order);
@@ -883,7 +1014,17 @@ function autoStagesFor(type){
   return tpl.stages.map(key => ({key, resp: defaultResp(key)}));
 }
 
-function autoStageInstruction(stageKey, task, context){
+const SVG_FORMAT_RULES = 'REGRAS OBRIGATÓRIAS DE FORMATO: responda APENAS com o código SVG, começando exatamente por <svg e terminando exatamente por </svg>. Não use Markdown nem cercas ```; não escreva nenhuma explicação antes ou depois do SVG. Use um único elemento <svg> raiz com xmlns="http://www.w3.org/2000/svg" e viewBox. O XML deve ser válido: escreva & como &amp;, feche todas as tags e coloque aspas em todos os atributos. Sem <script>, sem imagens externas e sem links.';
+function autoStageInstruction(stageKey, task, context, opts = {}){
+  if (opts.svg){
+    const extra = stageKey === 'revisao'
+      ? 'O material principal desta tarefa é um criativo SVG (o SVG mais recente está no contexto abaixo). Entregue o SVG REVISADO e COMPLETO, corrigindo textos, CTA e coerência. Não devolva comentários nem texto fora do SVG.'
+      : '';
+    return `${autoStageInstructionBase(stageKey, task, context)}\n\n${extra ? extra + '\n\n' : ''}${SVG_FORMAT_RULES}`;
+  }
+  return autoStageInstructionBase(stageKey, task, context);
+}
+function autoStageInstructionBase(stageKey, task, context){
   const base = `Pedido original do proprietário:\n${task.desc || task.title}\n\nContexto e resultados anteriores disponíveis:\n${context || 'Nenhum resultado anterior.'}`;
   const common = 'Você trabalha no Escritório Virtual de Marketing — Salário-Maternidade. Seja objetivo e produza um resultado utilizável. Não invente fatos, números, leis, fontes ou ações externas. Se algo não puder ser verificado com os dados disponíveis, deixe isso explícito.';
   const map = {
@@ -898,29 +1039,58 @@ function autoStageInstruction(stageKey, task, context){
   return `${map[stageKey] || common}\n\n${base}`;
 }
 
+const CONTEXT_TEXT_MAX = 12000, CONTEXT_SVG_MAX = 150000;
 async function previousStageContext(taskId){
-  const files = Store.all('files').filter(f => f.taskId === taskId).sort((a,b) => a.createdAt - b.createdAt);
+  const files = Store.all('files').filter(f => f.taskId === taskId).sort((a,b) => a.createdAt - b.createdAt).slice(-10);
+  const lastSvg = (await latestValidSVG(taskId)).file;
+  if (lastSvg && !files.some(f => f.id === lastSvg.id)) files.unshift(lastSvg);   // o SVG vigente sempre entra no contexto
   const chunks = [];
-  for (const f of files.slice(-10)){
+  for (const f of files){
+    const isSvg = /\.svg$/i.test(f.name) || /svg/i.test(f.mime || '');
+    const isText = isSvg || (f.mime || '').startsWith('text/') || /\.(txt|md|json|csv)$/i.test(f.name);
     let body = '';
-    try {
-      if (Store.available(f)){
-        const b = await Store.getBlob(f);
-        if ((f.mime || '').startsWith('text/') || /\.(txt|md|json|svg)$/i.test(f.name)) body = await b.text();
-      }
-    } catch(e) {}
-    chunks.push(`ARQUIVO: ${f.name}\nETAPA: ${f.stageKey ? STAGES[f.stageKey].label : '—'}\n${body.slice(0,12000)}`);
+    if (!isText) body = '[arquivo binário — conteúdo não incluído]';
+    else if (!Store.available(f)) body = '[conteúdo indisponível neste navegador]';
+    else {
+      try {
+        body = await (await Store.getBlob(f)).text();
+        if (isSvg){
+          const v = validateSVGString(body);
+          if (!v.ok) body = `[SVG inválido ignorado: ${v.motivo}]`;
+          else if (lastSvg && f.id !== lastSvg.id) body = '[versão anterior do SVG — use apenas a versão mais recente, incluída em outro trecho deste contexto]';
+        }
+      } catch (e){ body = '[não foi possível ler o conteúdo]'; }
+    }
+    const max = isSvg ? CONTEXT_SVG_MAX : CONTEXT_TEXT_MAX;
+    if (body.length > max) body = body.slice(0, max) + '\n[… conteúdo truncado para o contexto …]';
+    chunks.push(`ARQUIVO: ${f.name}\nETAPA: ${f.stageKey && STAGES[f.stageKey] ? STAGES[f.stageKey].label : '—'}\n${body}`);
   }
   return chunks.join('\n\n---\n\n');
 }
 
-function resultFileSpec(stageKey, resultText, task){
-  const isSvg = /<svg[\s>]/i.test(resultText) && /<\/svg>/i.test(resultText);
+/* kind: 'svg' (conteúdo já saneado por sanitizeSVG) ou 'txt'. Última barreira: nunca gera arquivo vazio nem SVG inválido. */
+function resultFileSpec(stageKey, resultText, task, kind){
+  const content = String(resultText || '');
+  if (!content.trim()) throw new Error('resultado vazio — nada foi guardado');
+  const isSvg = kind === 'svg';
+  if (isSvg){ const v = validateSVGString(content); if (!v.ok) throw new Error('SVG inválido — nada foi guardado: ' + v.motivo); }
   const ext = isSvg ? 'svg' : 'txt';
   const mime = isSvg ? 'image/svg+xml' : 'text/plain;charset=utf-8';
   const prefix = stageKey === 'pesquisa' ? 'pesquisa' : stageKey === 'copy' ? 'copy' : stageKey === 'roteiro' ? 'roteiro' : stageKey === 'criativo' ? 'criativo' : stageKey === 'revisao' ? (isSvg ? 'criativo_revisado' : 'revisao') : stageKey;
   const safe = norm(task.code + '_' + task.title).replace(/[^a-z0-9]+/g,'_').replace(/^_|_$/g,'').slice(0,48);
-  return {name:`${prefix}_${safe}_${new Date().toISOString().slice(0,10)}.${ext}`, mime, blob:new Blob([resultText], {type:mime})};
+  return {name:`${prefix}_${safe}_${new Date().toISOString().slice(0,10)}.${ext}`, mime, blob:new Blob([content], {type:mime})};
+}
+
+/* Falha de etapa automática: registra, põe a tarefa em "Problema" (notifica Marcos e Helena) e a automação para ali. */
+async function failAutoStage(id, s, motivo){
+  motivo = String(motivo || 'falha desconhecida').trim().replace(/[.\s]+$/, '');
+  try {
+    const t = T(id); if (!t) return;
+    hist(t, `${person(s.resp).name} não conseguiu concluir ${s.label}: ${motivo}. Nenhum arquivo foi guardado e a etapa não foi concluída.`, 'ia_erro', 'automacao');
+    await Store.put('tasks', t);
+    setHold(id, 'problema', `${s.label} — ${motivo}`, s.resp);
+  } catch (e){ console.warn('failAutoStage', e); }
+  renderHUD(); syncAgents(); dirty = true;
 }
 
 async function executeLocalResearchStage(id){
@@ -964,97 +1134,149 @@ async function executeLocalResearchStage(id){
   hist(t, 'Lívia executou a pesquisa estratégica automaticamente, sem alegar navegação externa.', 'ia_inicio', 'automacao');
   await Store.put('tasks', t);
   notify(`Lívia está trabalhando em Pesquisa: ${t.title}`, 'ia', t.id);
-  const spec = resultFileSpec('pesquisa', texto, t);
-  await attachFiles(t.id, t.cur, [{blob:spec.blob,name:spec.name}], STAGES.pesquisa.cat, s.resp, 'pesquisa_local_automatica');
+  const idx = t.cur;
+  const spec = resultFileSpec('pesquisa', texto, t, 'txt');
+  const saved = await attachFiles(t.id, idx, [{blob:spec.blob,name:spec.name}], STAGES.pesquisa.cat, s.resp, 'pesquisa_local_automatica');
+  if (!saved.length){ await failAutoStage(id, s, 'o arquivo da pesquisa não pôde ser guardado'); return {ok:false, mensagem:'Arquivo da pesquisa não foi guardado.'}; }
   const after = T(id);
-  if (after && after.stages[after.cur] && after.stages[after.cur].status === 'andamento') {
-    completeStage(id, `Pesquisa estratégica produzida automaticamente e guardada na Estante como ${spec.name}.`);
-    const done = T(id);
-    hist(done, 'Lívia entregou a Pesquisa automaticamente.', 'ia_conclusao', 'automacao');
-    await Store.put('tasks', done);
-    notify(`Pesquisa concluída por Lívia: ${done.title}`, 'ia_conclusao', done.id);
-  }
+  const sa = after && after.stages[idx];
+  if (!after || after.cur !== idx || !sa || sa.key !== 'pesquisa' || sa.status !== 'andamento' || after.hold) return {ok:false, mensagem:'A etapa mudou antes da entrega.'};
+  if (!completeStage(id, `Pesquisa estratégica produzida automaticamente e guardada na Estante como ${spec.name}.`)) return {ok:false, mensagem:'Não foi possível concluir a Pesquisa.'};
+  const done = T(id);
+  hist(done, 'Lívia entregou a Pesquisa automaticamente.', 'ia_conclusao', 'automacao');
+  await Store.put('tasks', done);
+  notify(`Pesquisa concluída por Lívia: ${done.title}`, 'ia_conclusao', done.id);
   renderHUD(); syncAgents(); dirty = true;
   return {ok:true,text:texto,fileName:spec.name};
 }
 
+/* Executa a etapa atual com a IA. Uma etapa só é concluída com um arquivo válido guardado na Estante;
+   qualquer falha (erro da IA, resposta vazia, mensagem de erro, SVG inválido, exceção) põe a tarefa em "Problema". */
 async function executeAutoStage(id){
   const t = T(id); if (!t) return {ok:false, mensagem:'Tarefa não encontrada.'};
   const s = t.stages[t.cur];
   if (!s || !AI_AUTO_STAGES.has(s.key) || s.status !== 'andamento' || t.hold) return {ok:false, mensagem:'Etapa não disponível para execução automática.'};
-  if (s.key === 'pesquisa') return executeLocalResearchStage(id);
-  const ia = window.EVIntegracoes && window.EVIntegracoes.ia;
-  if (!ia || typeof ia.executar !== 'function' || !ia.conectada()) return {ok:false, mensagem:'A IA não está conectada ao escritório.'};
+  const lockKey = `${id}#${t.cur}#${s.key}`;
+  if (STAGE_LOCKS.has(lockKey)) return {ok:false, busy:true, mensagem:'Esta etapa já está sendo executada.'};
+  STAGE_LOCKS.add(lockKey);
+  try {
+    if (s.key === 'pesquisa') return await executeLocalResearchStage(id);
+    return await executeAIStage(id, t.cur, s.key);
+  } catch (e){
+    console.warn('executeAutoStage', e);
+    const motivo = `erro inesperado na execução (${(e && e.message) || e})`;
+    await failAutoStage(id, s, motivo);
+    return {ok:false, mensagem:motivo};
+  } finally { STAGE_LOCKS.delete(lockKey); }
+}
 
+async function executeAIStage(id, idx, key){
+  const t = T(id); const s = t.stages[idx];
+  const ia = window.EVIntegracoes && window.EVIntegracoes.ia;
+  if (!ia || typeof ia.executar !== 'function' || !ia.conectada()){
+    await failAutoStage(id, s, 'a IA não está conectada ao escritório');
+    return {ok:false, mensagem:'A IA não está conectada ao escritório.'};
+  }
+  const needsSvg = await stageNeedsSVG(key, id);
   const context = await previousStageContext(id);
-  const prompt = autoStageInstruction(s.key, t, context);
-  hist(t, `${person(s.resp).name} recebeu ${s.label} para execução automática.`, 'ia_inicio', 'automacao');
+  const prompt = autoStageInstruction(key, t, context, {svg: needsSvg});
+  hist(t, `${person(s.resp).name} recebeu ${s.label} para execução automática${needsSvg ? ' (entrega obrigatória em SVG válido)' : ''}.`, 'ia_inicio', 'automacao');
   await Store.put('tasks', t);
   notify(`${person(s.resp).name} está trabalhando em ${s.label}: ${t.title}`, 'ia', t.id);
   renderHUD(); syncAgents(); dirty = true;
 
-  const result = await ia.executar({agente:person(s.resp).name, etapa:s.label, tarefa:t, instrucao:prompt});
-  const atual = T(id);
-  if (!atual) return {ok:false, mensagem:'A tarefa deixou de existir durante a execução.'};
-  if (!result.ok || !result.text){
-    const detalheErro = result.mensagem || (result.status ? `Erro HTTP ${result.status}` : 'sem resultado');
-    hist(atual, `${person(s.resp).name} não conseguiu concluir ${s.label}: ${detalheErro}.`, 'ia_erro', 'automacao');
-    await Store.put('tasks', atual);
-    notify(`Problema em ${s.label}: ${detalheErro}`, 'ia_erro', atual.id, null, ['gerente','secretaria']);
-    renderHUD(); syncAgents();
-    return {...result, mensagem: detalheErro};
-  }
+  /* a etapa continua a mesma, em andamento e sem pausa/problema? (o usuário pode ter agido durante a chamada) */
+  const stillCurrent = () => { const x = T(id); const xs = x && x.stages[idx]; return x && x.cur === idx && xs && xs.key === key && xs.status === 'andamento' && !x.hold ? x : null; };
+  const discard = async why => {
+    const x = T(id);
+    if (x){ hist(x, `Resultado de ${s.label} descartado: ${why}. A etapa será refeita quando a automação for retomada.`, 'info', 'automacao'); await Store.put('tasks', x); }
+    renderHUD(); syncAgents(); dirty = true;
+    return {ok:false, mensagem:`Resultado descartado: ${why}.`};
+  };
 
-  const final = T(id); const sf = final && final.stages[final.cur];
-  if (!final || !sf || sf.status !== 'andamento') return {ok:false, mensagem:'A etapa mudou antes da entrega.'};
-  const cleaned = cleanAIText(result.text);
-  const spec = resultFileSpec(sf.key, cleaned, final);
-  await attachFiles(final.id, final.cur, [{blob:spec.blob,name:spec.name}], STAGES[sf.key].cat, sf.resp, 'ia_gemini_auto');
-  const after = T(id);
-  if (after && after.stages[after.cur] && after.stages[after.cur].status === 'andamento'){
-    completeStage(id, `Resultado produzido automaticamente e guardado na Estante como ${spec.name}.`);
-    const done = T(id); hist(done, `${person(sf.resp).name} entregou ${sf.label} automaticamente.`, 'ia_conclusao', 'automacao'); await Store.put('tasks', done);
-    notify(`${sf.label} concluída: ${done.title}`, 'ia_conclusao', done.id);
+  const maxTries = needsSvg ? 2 : 1;   // SVG: uma nova tentativa com o motivo da recusa
+  let built = null, motivo = '';
+  for (let tentativa = 1; tentativa <= maxTries; tentativa++){
+    const instrucao = tentativa === 1 ? prompt
+      : `${prompt}\n\nATENÇÃO: a resposta anterior foi recusada porque ${motivo}. Gere novamente o SVG COMPLETO, seguindo rigorosamente as regras de formato.`;
+    let result;
+    try { result = await ia.executar({agente:person(s.resp).name, etapa:s.label, tarefa:t, instrucao}); }
+    catch (e){ result = {ok:false, mensagem:`falha ao chamar a IA (${(e && e.message) || e})`}; }
+    result = result || {ok:false, mensagem:'a IA não respondeu'};
+    if (!T(id)) return {ok:false, mensagem:'A tarefa deixou de existir durante a execução.'};
+    if (!stillCurrent()) return discard('a etapa foi alterada, pausada ou marcada com problema durante a execução');
+    if (!result.ok || typeof result.text !== 'string' || !result.text.trim()){
+      motivo = result.ok ? 'a IA devolveu uma resposta vazia' : (result.mensagem || (result.status ? `erro HTTP ${result.status}` : 'sem resultado da IA'));
+      break;   // erro de comunicação/IA: não insiste (o integracoes.js já tentou de novo)
+    }
+    built = buildStageResult(result.text, needsSvg);
+    if (built.ok) break;
+    motivo = built.motivo; built = null;
+    if (tentativa < maxTries){
+      const x = T(id); hist(x, `${person(s.resp).name}: resposta de ${s.label} recusada (${motivo}). Pedindo nova versão à IA.`, 'ia_erro', 'automacao'); await Store.put('tasks', x);
+    }
   }
+  if (!built){ await failAutoStage(id, s, motivo); return {ok:false, mensagem:motivo}; }
+
+  const cur = stillCurrent(); if (!cur) return discard('a etapa mudou antes da entrega');
+  const spec = resultFileSpec(key, built.content, cur, built.isSvg ? 'svg' : 'txt');
+  const saved = await attachFiles(id, idx, [{blob:spec.blob, name:spec.name}], STAGES[key].cat, s.resp, 'ia_gemini_auto');
+  if (!saved.length){ await failAutoStage(id, s, 'o arquivo não pôde ser guardado na Estante'); return {ok:false, mensagem:'Arquivo não guardado.'}; }
+  if (!stillCurrent()) return {ok:false, mensagem:'A etapa mudou antes da conclusão; o arquivo ficou guardado na Estante.'};
+  if (!completeStage(id, `Resultado produzido automaticamente e guardado na Estante como ${spec.name}.`)) return {ok:false, mensagem:`Não foi possível concluir ${s.label}.`};
+  const done = T(id); hist(done, `${person(s.resp).name} entregou ${s.label} automaticamente.`, 'ia_conclusao', 'automacao'); await Store.put('tasks', done);
+  notify(`${s.label} concluída: ${done.title}`, 'ia_conclusao', done.id);
   renderHUD(); syncAgents(); dirty = true;
-  return {ok:true,text:cleaned,fileName:spec.name};
+  return {ok:true, text:built.content, fileName:spec.name};
 }
 
+/* Laço de automação: uma execução por tarefa (AUTO_RUNNERS). Para na primeira falha, pausa ou problema. */
 async function runTaskAutomation(id){
-  if (AUTO_RUNNERS.has(id)) return;
+  if (AUTO_RUNNERS.has(id)) return false;
   AUTO_RUNNERS.add(id);
+  const t0 = T(id), wasDone = !!t0 && taskStatus(t0) === 'ok';
   try {
     let guard = 0;
-    while (guard++ < 20){
+    while (guard++ < 30){
       const t = T(id); if (!t || taskStatus(t) === 'ok' || t.hold) break;
       const s = curStage(t); if (!s) break;
-      if (s.status === 'aguardando') startStage(id);
-      const current = T(id); const cs = current && curStage(current); if (!cs) break;
+      if (s.status === 'aguardando' && !startStage(id)) break;
+      const current = T(id); const cs = current && curStage(current);
+      if (!cs || cs.status !== 'andamento') break;
       if (cs.key === 'publicacao'){
-        completeStage(id, 'Publicação preparada automaticamente. Nenhuma rede social foi acessada ou publicada nesta versão.');
+        // Somente prepara/registra: nenhuma rede social (Instagram, Facebook, TikTok, Meta Ads) é acessada.
+        if (!completeStage(id, 'Publicação preparada automaticamente. Nenhuma rede social foi acessada ou publicada nesta versão.')) break;
         notify(`Material pronto para publicação manual: ${current.title}`, 'entrega', current.id, null, ['voce']);
         continue;
       }
       if (cs.key === 'arquivamento'){
-        completeStage(id, 'Arquivamento realizado automaticamente na Estante.');
+        if (!completeStage(id, 'Arquivamento realizado automaticamente na Estante.')) break;
         continue;
       }
       const r = await executeAutoStage(id);
-      if (!r.ok) break;
+      if (!r || !r.ok) break;
     }
     const final = T(id);
-    if (final && taskStatus(final) === 'ok'){
+    if (final && !wasDone && taskStatus(final) === 'ok'){
       notify(`✅ Marcos entregou a tarefa pronta: ${final.title}. O material está na Estante.`, 'entrega', final.id, null, ['voce']);
       toast(`✅ Marcos entregou: ${final.title}. Veja na Estante.`);
     }
-    renderHUD(); syncAgents(); if (H.view) renderHub(); if (panelAgent) renderPanel();
-  } finally { AUTO_RUNNERS.delete(id); }
+  } catch (e){
+    console.warn('runTaskAutomation', e);
+    const t = T(id), s = t && curStage(t);
+    if (t && s && !t.hold) setHold(id, 'problema', `Erro inesperado na automação (${(e && e.message) || e})`, 'gerente');
+    toast('Erro na automação. A tarefa foi marcada com problema.');
+  } finally {
+    AUTO_RUNNERS.delete(id);
+    renderHUD(); syncAgents(); dirty = true; if (H.view) renderHub(); if (panelAgent) renderPanel();
+  }
+  return true;
 }
 
 function aiInstructionForStage(stageKey){ return `Execute a etapa ${STAGES[stageKey] ? STAGES[stageKey].label : stageKey} de forma completa e entregue um resultado utilizável.`; }
 
 function completeStage(id, note){
-  const t = T(id); if (!t) return; const s = t.stages[t.cur]; if (!s || s.status !== 'andamento' || t.hold) return;
+  const t = T(id); if (!t) return false; const s = t.stages[t.cur]; if (!s || s.status !== 'andamento' || t.hold) return false;
   s.status = 'concluida'; s.doneAt = now();
   hist(t, `${STAGES[s.key].done} por ${person(s.resp).name}${note ? ' — ' + note : ''}.`, 'conclusao');
   notify(`${STAGES[s.key].done}: ${t.title}`, 'etapa', t.id);
@@ -1063,6 +1285,7 @@ function completeStage(id, note){
   if (nx){ t.cur++; nx.status = 'aguardando'; assignNote(t, nx); }
   else { t.doneAt = now(); hist(t, 'Tarefa concluída.', 'conclusao'); notify(`Tarefa concluída: ${t.title}`, 'tarefa', t.id); }
   Store.put('tasks', t);
+  return true;
 }
 /* Devolver para ajustes: volta para uma etapa anterior (padrão: a imediatamente anterior) */
 function returnStage(id, note, toIdx){
@@ -1112,7 +1335,7 @@ async function attachFiles(taskId, stageIdx, list, cat, resp, origin){
       stageKey: t0 && t0.stages[stageIdx] ? t0.stages[stageIdx].key : null, resp, createdAt: now(), by: 'voce', origin}, saved);
     await Store.put('files', f); results.push(f);
     const t = T(taskId);
-    if (t){ hist(t, `Arquivo "${name}" guardado na estante (${catById[cat].label}, etapa ${f.stageKey ? STAGES[f.stageKey].label : '—'}), por ${person(resp).name}${f.storage !== 'assets' && Store.mode === 'cloud' ? ' — salvo só neste navegador' : ''}.`, 'arquivo'); Store.put('tasks', t); }
+    if (t){ hist(t, `Arquivo "${name}" guardado na estante (${(catById[cat] || catById.outros).label}, etapa ${f.stageKey ? STAGES[f.stageKey].label : '—'}), por ${person(resp).name}${f.storage !== 'assets' && Store.mode === 'cloud' ? ' — salvo só neste navegador' : ''}.`, 'arquivo'); Store.put('tasks', t); }
     notify(`Novo arquivo disponível: ${name}`, 'arquivo', taskId, f.id);
   }
   return results;
@@ -1384,6 +1607,8 @@ function stageActions(t){
   if (s.status === 'andamento'){
     b.push(`<button class="btn sm ok" data-act="complete" data-t="${t.id}" type="button">${s.key === 'revisao' ? 'Concluir revisão' : 'Concluir etapa: ' + esc(s.label)}</button>`);
     b.push(`<button class="btn sm" data-act="deliver" data-t="${t.id}" type="button">Registrar entrega</button>`);
+    // etapa automática parada em andamento (ex.: página recarregada durante a execução) — permite retomar sem duplicar
+    if (AI_AUTO_STAGES.has(s.key) && !AUTO_RUNNERS.has(t.id)) b.push(`<button class="btn sm" data-act="runauto" data-t="${t.id}" type="button">Executar automação</button>`);
   }
   if (t.cur > 0) b.push(`<button class="btn sm" data-act="return" data-t="${t.id}" type="button">Devolver para ajustes</button>`);
   return b.join('');
@@ -1731,11 +1956,11 @@ function openNewTask(prefill){
     const order = $('#nDesc').value.trim(); if (!order) return;
     const type = inferOrderType(order), stages = autoStagesFor(type);
     const title = order.length > 100 ? order.slice(0,97) + '…' : order;
-    const t = createTask({title, desc:order, type, priority:$('#nPrio').value, due:$('#nDue').value, notes:'Ordem recebida por Marcos. Execução automática ativada.', stages});
+    const t = createTask({title, desc:order, type, priority:$('#nPrio').value, due:$('#nDue').value, notes:'Ordem recebida por Marcos. Execução automática ativada.', stages, auto:true});
     closeDlg();
     toast(`Marcos recebeu a ordem ${t.code}. A equipe começou a trabalhar.`);
     openHub('task', t.id);
-    runTaskAutomation(t.id);
+    runTaskAutomation(t.id).catch(err => console.warn('automação', err));
   });
 }
 
@@ -1811,7 +2036,13 @@ async function openViewer(fid){
   try {
     let url = Store.viewUrl(f);
     if (!url){ const b = await Store.getBlob(f); url = URL.createObjectURL(b); setTimeout(() => URL.revokeObjectURL(url), 600000); }
-    if (m.startsWith('image/')) box.innerHTML = `<img src="${url}" alt="${esc(f.name)}">`;
+    if (m.startsWith('image/svg') || e === 'svg'){
+      // SVG é validado antes de exibir: arquivos antigos gerados com texto/Markdown junto não quebram a Estante
+      const txt = await (await Store.getBlob(f)).text(), chk = validateSVGString(txt);
+      box.innerHTML = chk.ok ? `<img src="${url}" alt="${esc(f.name)}">`
+        : `<p class="warnbox">Este SVG está inválido e não pode ser exibido (${esc(chk.motivo)}). Exclua o arquivo e refaça a etapa.</p><pre>${esc(txt.slice(0, 4000))}</pre>`;
+    }
+    else if (m.startsWith('image/')) box.innerHTML = `<img src="${url}" alt="${esc(f.name)}">`;
     else if (m.startsWith('video/') || ['mp4','webm','mov'].includes(e)) box.innerHTML = `<video src="${url}" controls playsinline></video>`;
     else if (m.startsWith('audio/')) box.innerHTML = `<audio src="${url}" controls></audio>`;
     else if (m === 'application/pdf' || e === 'pdf') box.innerHTML = `<iframe src="${url}" title="${esc(f.name)}"></iframe><p class="meta">Se a pré-visualização não aparecer, use Baixar.</p>`;
@@ -1877,7 +2108,14 @@ document.addEventListener('click', async e => {
       const t = Store.get('tasks', tid), s = t && curStage(t);
       if (!startStage(tid)) { toast('Não foi possível iniciar esta etapa.'); return; }
       toast(s ? `${s.label} iniciada manualmente.` : 'Etapa iniciada.');
-      if (s && AI_AUTO_STAGES.has(s.key)) executeAutoStage(tid).catch(err => toast(`Erro na execução: ${err.message || err}`));
+      // passa pelo laço de automação (com trava por tarefa) em vez de chamar a etapa direto: evita execução duplicada e mantém o fluxo seguindo
+      if (s && AI_AUTO_STAGES.has(s.key)) runTaskAutomation(tid).catch(err => toast(`Erro na execução: ${err.message || err}`));
+    }
+    else if (a === 'runauto'){
+      const t = Store.get('tasks', tid);
+      if (!t || t.hold || AUTO_RUNNERS.has(tid)){ toast(t && t.hold ? 'Retome a tarefa antes de executar a automação.' : 'A automação desta tarefa já está em execução.'); return; }
+      toast('Automação retomada.');
+      runTaskAutomation(tid).catch(err => toast(`Erro na execução: ${err.message || err}`));
     }
     else if (a === 'complete'){ const t = Store.get('tasks', tid), s = t && curStage(t), nf = Store.all('files').filter(f => f.taskId === tid && f.stageKey === s.key).length, nx = nextStage(t);
       openNoteDlg(s.key === 'revisao' ? 'Concluir revisão' : `Concluir ${s.label}`, `Observação da conclusão (opcional)${nf ? '' : ' — nenhum arquivo foi guardado nesta etapa'}`, 'Confirmar conclusão',
@@ -1891,7 +2129,11 @@ document.addEventListener('click', async e => {
     else if (a === 'pause') openNoteDlg('Pausar tarefa', 'Motivo (opcional)', 'Pausar', note => { setHold(tid, 'pausada', note); toast('Tarefa pausada.'); });
     else if (a === 'problem') openNoteDlg('Marcar problema', 'Motivo do problema', 'Marcar problema', note => { setHold(tid, 'problema', note, $('#pWho').value); toast('Problema registrado. Gerente e Secretária notificados.'); },
       {danger: true, required: true, before: `<label class="f">Quem identificou${respSelect('pWho', 'voce')}</label>`});
-    else if (a === 'resume'){ setHold(tid, null); toast('Tarefa retomada.'); }
+    else if (a === 'resume'){
+      setHold(tid, null); toast('Tarefa retomada.');
+      // tarefa automática: a equipe volta a trabalhar a partir da etapa que parou (a etapa com problema é refeita)
+      if (isAutoTask(Store.get('tasks', tid))) runTaskAutomation(tid).catch(err => toast(`Erro na execução: ${err.message || err}`));
+    }
     else if (a === 'savenotes'){ setNotes(tid, $('#tNotes').value); toast('Observações salvas.'); }
     else if (a === 'addnote'){ const v = $('#tNewNote').value.trim(); if (!v){ toast('Escreva a observação.'); return; } addNote(tid, v); toast('Observação registrada no histórico.'); }
     else if (a === 'deltask') confirmInline(act, 'Clique de novo para excluir', () => { deleteTask(tid); toast('Tarefa excluída.'); openHub(H.prev || 'tarefas'); });
