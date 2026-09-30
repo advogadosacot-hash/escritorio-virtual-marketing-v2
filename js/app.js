@@ -858,63 +858,144 @@ function startStage(id){
   return true;
 }
 
-const AI_AUTO_STAGES = new Set(['copy', 'roteiro']);
-function aiInstructionForStage(stageKey){
-  const instructions = {
-    copy: 'Produza a COPY completa para a tarefa. Entregue gancho, texto principal, chamada para ação e, quando fizer sentido, uma legenda pronta para publicação. Respeite as informações fornecidas na tarefa e não invente dados jurídicos ou valores que não estejam no contexto.',
-    roteiro: 'Produza um roteiro completo para a tarefa, organizado por cenas. Inclua abertura forte, desenvolvimento, falas/textos de tela quando úteis e encerramento com chamada para ação. Não invente fatos jurídicos ou dados que não estejam no contexto.'
-  };
-  return instructions[stageKey] || '';
+const AI_AUTO_STAGES = new Set(['pesquisa','copy','roteiro','criativo','revisao','finalizacao','analise']);
+const AUTO_RUNNERS = new Set();
+
+function cleanAIText(text){
+  let x = String(text || '').trim();
+  x = x.replace(/^```(?:svg|xml|html|text)?\s*/i, '').replace(/\s*```$/i, '').trim();
+  return x;
 }
 
-async function executeAIStage(id){
+function inferOrderType(order){
+  const q = norm(order);
+  if (/\b(video|reel|reels|video curto)\b/.test(q)) return 'video';
+  if (/\b(anuncio|ads|trafego pago|meta ads)\b/.test(q)) return 'anuncio';
+  if (/\b(relatorio|metricas|resultados|analise de campanha)\b/.test(q)) return 'relatorio';
+  if (/\b(artigo|texto longo|artigo para blog)\b/.test(q)) return 'texto';
+  if (/\b(campanha|campanha completa)\b/.test(q)) return 'campanha';
+  if (/\b(post|carrossel|criativo|arte|imagem|banner|card|story|stories)\b/.test(q)) return 'post';
+  return 'outro';
+}
+
+function autoStagesFor(type){
+  const tpl = TEMPLATES.find(x => x.id === type) || TEMPLATES.find(x => x.id === 'outro');
+  return tpl.stages.map(key => ({key, resp: defaultResp(key)}));
+}
+
+function autoStageInstruction(stageKey, task, context){
+  const base = `Pedido original do proprietário:\n${task.desc || task.title}\n\nContexto e resultados anteriores disponíveis:\n${context || 'Nenhum resultado anterior.'}`;
+  const common = 'Você trabalha no Escritório Virtual de Marketing — Salário-Maternidade. Seja objetivo e produza um resultado utilizável. Não invente fatos, números, leis, fontes ou ações externas. Se algo não puder ser verificado com os dados disponíveis, deixe isso explícito.';
+  const map = {
+    pesquisa: `${common}\n\nVocê é Lívia, pesquisadora. Não finja que navegou na internet: neste momento você não possui busca web. Faça um levantamento estratégico usando apenas o pedido e o contexto fornecido. Organize público, objetivo, mensagem central, pontos que precisam de verificação externa e recomendações úteis para Rafael e Bia.`,
+    copy: `${common}\n\nVocê é Rafael, copywriter. Produza a copy pronta para uso: gancho, texto principal, CTA e, quando adequado, legenda. Aproveite o contexto da pesquisa sem repetir informações não verificadas como fatos.`,
+    roteiro: `${common}\n\nVocê é Rafael, roteirista. Produza um roteiro pronto para gravação, dividido por cenas, com abertura forte, falas/textos de tela e CTA.`,
+    criativo: `${common}\n\nVocê é Bia, diretora criativa. Entregue o CRIATIVO FINAL como SVG válido, completo e autossuficiente, preferencialmente em 1080x1350 para post ou 1080x1920 para story/reel. Use apenas formas, cores e textos vetoriais; não use imagens externas, links ou scripts. O SVG deve estar pronto para ser visualizado na Estante. Retorne SOMENTE o código SVG, começando por <svg e terminando por </svg>. Inclua texto legível em português e uma composição profissional de marketing para o pedido.`,
+    revisao: `${common}\n\nVocê é Marcos, gerente. Revise os materiais produzidos nas etapas anteriores. Verifique clareza, coerência com o pedido, CTA, consistência e riscos de afirmações não verificadas. Se o material principal for um SVG, devolva uma versão SVG corrigida e pronta; caso contrário, devolva uma versão final corrigida do texto. Não apenas dê opinião: entregue o material revisado.`,
+    finalizacao: `${common}\n\nVocê é Marcos, responsável pela finalização. Consolide os resultados anteriores em uma entrega final clara e pronta para uso. Se já existir um criativo SVG aprovado, não o transforme em texto: registre a entrega e produza um pequeno arquivo de instruções/legenda final.`,
+    analise: `${common}\n\nVocê é Otávio, analista. Analise os materiais e o objetivo da tarefa. Como não há métricas externas conectadas agora, não invente números. Produza um relatório com o que foi produzido, pontos fortes, pendências e quais métricas deverão ser acompanhadas quando a campanha for publicada.`,
+  };
+  return `${map[stageKey] || common}\n\n${base}`;
+}
+
+async function previousStageContext(taskId){
+  const files = Store.all('files').filter(f => f.taskId === taskId).sort((a,b) => a.createdAt - b.createdAt);
+  const chunks = [];
+  for (const f of files.slice(-10)){
+    let body = '';
+    try {
+      if (Store.available(f)){
+        const b = await Store.getBlob(f);
+        if ((f.mime || '').startsWith('text/') || /\.(txt|md|json|svg)$/i.test(f.name)) body = await b.text();
+      }
+    } catch(e) {}
+    chunks.push(`ARQUIVO: ${f.name}\nETAPA: ${f.stageKey ? STAGES[f.stageKey].label : '—'}\n${body.slice(0,12000)}`);
+  }
+  return chunks.join('\n\n---\n\n');
+}
+
+function resultFileSpec(stageKey, resultText, task){
+  const isSvg = /<svg[\s>]/i.test(resultText) && /<\/svg>/i.test(resultText);
+  const ext = isSvg ? 'svg' : 'txt';
+  const mime = isSvg ? 'image/svg+xml' : 'text/plain;charset=utf-8';
+  const prefix = stageKey === 'pesquisa' ? 'pesquisa' : stageKey === 'copy' ? 'copy' : stageKey === 'roteiro' ? 'roteiro' : stageKey === 'criativo' ? 'criativo' : stageKey === 'revisao' ? (isSvg ? 'criativo_revisado' : 'revisao') : stageKey;
+  const safe = norm(task.code + '_' + task.title).replace(/[^a-z0-9]+/g,'_').replace(/^_|_$/g,'').slice(0,48);
+  return {name:`${prefix}_${safe}_${new Date().toISOString().slice(0,10)}.${ext}`, mime, blob:new Blob([resultText], {type:mime})};
+}
+
+async function executeAutoStage(id){
   const t = T(id); if (!t) return {ok:false, mensagem:'Tarefa não encontrada.'};
   const s = t.stages[t.cur];
-  /* BLOQUEIO EXPLÍCITO: Pesquisa nunca chama a Gemini. Somente Copy e Roteiro. */
-  if (!s || (s.key !== 'copy' && s.key !== 'roteiro')) return {ok:false, mensagem:'A IA automática está disponível somente para Copy e Roteiro.'};
-  if (s.status !== 'andamento' || t.hold) return {ok:false, mensagem:'Esta etapa não está disponível para execução automática pela IA.'};
+  if (!s || !AI_AUTO_STAGES.has(s.key) || s.status !== 'andamento' || t.hold) return {ok:false, mensagem:'Etapa não disponível para execução automática.'};
   const ia = window.EVIntegracoes && window.EVIntegracoes.ia;
   if (!ia || typeof ia.executar !== 'function' || !ia.conectada()) return {ok:false, mensagem:'A IA não está conectada ao escritório.'};
 
-  hist(t, `${person(s.resp).name} enviou ${s.label} para execução da IA.`, 'ia_inicio');
-  Store.put('tasks', t);
-  notify(`IA executando ${s.label}: ${t.title}`, 'ia', t.id);
+  const context = await previousStageContext(id);
+  const prompt = autoStageInstruction(s.key, t, context);
+  hist(t, `${person(s.resp).name} recebeu ${s.label} para execução automática.`, 'ia_inicio', 'automacao');
+  await Store.put('tasks', t);
+  notify(`${person(s.resp).name} está trabalhando em ${s.label}: ${t.title}`, 'ia', t.id);
   renderHUD(); syncAgents(); dirty = true;
 
-  const result = await ia.executar({
-    agente: person(s.resp).name,
-    etapa: s.label,
-    tarefa: t,
-    instrucao: aiInstructionForStage(s.key)
-  });
-
+  const result = await ia.executar({agente:person(s.resp).name, etapa:s.label, tarefa:t, instrucao:prompt});
   const atual = T(id);
   if (!atual) return {ok:false, mensagem:'A tarefa deixou de existir durante a execução.'};
-  const etapaAtual = atual.stages[atual.cur];
-  if (!result.ok || !result.text) {
-    hist(atual, `A execução da IA não concluiu ${s.label}: ${result.mensagem || 'sem resultado'}.`, 'ia_erro');
-    Store.put('tasks', atual);
-    notify(`IA não concluiu ${s.label}: ${atual.title}`, 'ia_erro', atual.id, null, ['gerente','secretaria']);
-    renderHUD(); syncAgents(); dirty = true;
+  if (!result.ok || !result.text){
+    hist(atual, `${person(s.resp).name} não conseguiu concluir ${s.label}: ${result.mensagem || 'sem resultado'}.`, 'ia_erro', 'automacao');
+    await Store.put('tasks', atual);
+    notify(`Problema em ${s.label}: ${atual.title}`, 'ia_erro', atual.id, null, ['gerente','secretaria']);
+    renderHUD(); syncAgents();
     return result;
   }
 
-  const nome = `${s.key}_${norm(atual.code + '_' + atual.title).replace(/[^a-z0-9]+/g, '_').slice(0, 48)}_${new Date().toISOString().slice(0,10)}.txt`;
-  const blob = new Blob([result.text], {type:'text/plain;charset=utf-8'});
-  await attachFiles(atual.id, atual.cur, [{blob, name: nome}], STAGES[s.key].cat, s.resp, 'ia_gemini');
-
-  const final = T(id);
-  const sf = final && final.stages[final.cur];
-  if (final && sf && sf.status === 'andamento') {
-    completeStage(id, `Resultado produzido pela Gemini e guardado na Estante como ${nome}.`);
-    const next = T(id);
-    hist(next, `${person(s.resp).name} concluiu ${s.label} com auxílio da IA Gemini.`, 'ia_conclusao');
-    Store.put('tasks', next);
-    notify(`IA concluiu ${s.label}: ${next.title}`, 'ia_conclusao', next.id);
+  const final = T(id); const sf = final && final.stages[final.cur];
+  if (!final || !sf || sf.status !== 'andamento') return {ok:false, mensagem:'A etapa mudou antes da entrega.'};
+  const cleaned = cleanAIText(result.text);
+  const spec = resultFileSpec(sf.key, cleaned, final);
+  await attachFiles(final.id, final.cur, [{blob:spec.blob,name:spec.name}], STAGES[sf.key].cat, sf.resp, 'ia_gemini_auto');
+  const after = T(id);
+  if (after && after.stages[after.cur] && after.stages[after.cur].status === 'andamento'){
+    completeStage(id, `Resultado produzido automaticamente e guardado na Estante como ${spec.name}.`);
+    const done = T(id); hist(done, `${person(sf.resp).name} entregou ${sf.label} automaticamente.`, 'ia_conclusao', 'automacao'); await Store.put('tasks', done);
+    notify(`${sf.label} concluída: ${done.title}`, 'ia_conclusao', done.id);
   }
   renderHUD(); syncAgents(); dirty = true;
-  return result;
+  return {ok:true,text:cleaned,fileName:spec.name};
 }
+
+async function runTaskAutomation(id){
+  if (AUTO_RUNNERS.has(id)) return;
+  AUTO_RUNNERS.add(id);
+  try {
+    let guard = 0;
+    while (guard++ < 20){
+      const t = T(id); if (!t || taskStatus(t) === 'ok' || t.hold) break;
+      const s = curStage(t); if (!s) break;
+      if (s.status === 'aguardando') startStage(id);
+      const current = T(id); const cs = current && curStage(current); if (!cs) break;
+      if (cs.key === 'publicacao'){
+        completeStage(id, 'Publicação preparada automaticamente. Nenhuma rede social foi acessada ou publicada nesta versão.');
+        notify(`Material pronto para publicação manual: ${current.title}`, 'entrega', current.id, null, ['voce']);
+        continue;
+      }
+      if (cs.key === 'arquivamento'){
+        completeStage(id, 'Arquivamento realizado automaticamente na Estante.');
+        continue;
+      }
+      const r = await executeAutoStage(id);
+      if (!r.ok) break;
+    }
+    const final = T(id);
+    if (final && taskStatus(final) === 'ok'){
+      notify(`✅ Marcos entregou a tarefa pronta: ${final.title}. O material está na Estante.`, 'entrega', final.id, null, ['voce']);
+      toast(`✅ Marcos entregou: ${final.title}. Veja na Estante.`);
+    }
+    renderHUD(); syncAgents(); if (H.view) renderHub(); if (panelAgent) renderPanel();
+  } finally { AUTO_RUNNERS.delete(id); }
+}
+
+function aiInstructionForStage(stageKey){ return `Execute a etapa ${STAGES[stageKey] ? STAGES[stageKey].label : stageKey} de forma completa e entregue um resultado utilizável.`; }
+
 function completeStage(id, note){
   const t = T(id); if (!t) return; const s = t.stages[t.cur]; if (!s || s.status !== 'andamento' || t.hold) return;
   s.status = 'concluida'; s.doneAt = now();
@@ -1333,7 +1414,7 @@ function renderPanel(){
   const tasks = Store.all('tasks');
   if (a.id === 'gerente'){ body.innerHTML = managerPanel(tasks); foot.hidden = false;
     $('#pInput').placeholder = 'Descreva a missão (ex.: Campanha salário-maternidade — gestantes)';
-    $('#pNote').textContent = 'Ao enviar, abro "Nova tarefa" com o fluxo de etapas. Os funcionários ainda não têm IA: cada etapa avança quando é iniciada e concluída aqui.'; return; }
+    $('#pNote').textContent = 'Diga o que você quer. Marcos distribui o trabalho e a equipe executa automaticamente. Publicação externa ainda não é feita.'; return; }
   // demais funcionários
   const w = agentWork(a.id);
   const doneS = []; tasks.forEach(t => t.stages.forEach(s => s.resp === a.id && s.doneAt && doneS.push({t, s}))); doneS.sort((x, y) => y.s.doneAt - x.s.doneAt);
@@ -1351,7 +1432,7 @@ function renderPanel(){
     ${extra}
     <div><h4 class="sec">Etapas concluídas</h4>${doneS.length ? `<ul class="hist">${doneS.slice(0, 8).map(({t, s}) => `<li><time>${fmt(s.doneAt)}</time><span>${esc(s.label)} — ${esc(t.title)}</span></li>`).join('')}</ul>` : '<p class="meta">Nenhuma ainda.</p>'}</div>
     <div><h4 class="sec">${FOCUS[a.id] || 'Arquivos'} (${myFiles.length})</h4>${myFiles.length ? `<ul class="list">${myFiles.slice(0, 6).map(fileItem).join('')}</ul>` : '<p class="meta">Nenhum arquivo registrado por esta mesa.</p>'}</div>
-    <p class="meta">🤖 ${esc(IA_MSG())} ${esc(a.name)} não executa trabalho sozinha(o): as etapas avançam quando você as inicia e conclui.</p>`;
+    <p class="meta">🤖 ${esc(IA_MSG())} ${esc(a.name)} recebe as etapas automaticamente quando Marcos distribui a tarefa.</p>`;
   foot.hidden = true;
 }
 function managerPanel(tasks){
@@ -1361,7 +1442,7 @@ function managerPanel(tasks){
   const alerts = Store.all('notifs').filter(n => !n.read && n.to && n.to.includes('gerente')).sort((x, y) => y.t - x.t);
   const ids = ['pesquisador','copywriter','criativo','gerente','social','analista','secretaria','voce'];
   const [lbl, cls] = agentState(byId.gerente);
-  return `<div class="row" style="justify-content:space-between"><span class="pill"><span class="dot ${cls}"></span>${lbl}</span><button class="btn pri sm" data-act="newtask" type="button">+ Criar tarefa</button></div>
+  return `<div class="row" style="justify-content:space-between"><span class="pill"><span class="dot ${cls}"></span>${lbl}</span><button class="btn pri sm" data-act="newtask" type="button">+ Dar ordem a Marcos</button></div>
     <div class="stats">
       <div class="stat"><span>Pendentes</span><b>${act.length}</b></div><div class="stat"><span>Em andamento</span><b>${c('and')}</b></div>
       <div class="stat"><span>Em revisão</span><b>${c('rev')}</b></div><div class="stat"><span>Com problema</span><b>${c('prob')}</b></div>
@@ -1436,7 +1517,7 @@ function hubTasks(){
   list.sort((x, y) => (isActive(y) - isActive(x)) || (isActive(x) ? byPriority(x, y) : (y.doneAt - x.doneAt)));
   const working = tasks.filter(t => isActive(t) && !t.hold && curStage(t).status === 'andamento');
   return `<div class="row" style="justify-content:space-between"><div class="meta">${tasks.length} tarefa${tasks.length === 1 ? '' : 's'} registrada${tasks.length === 1 ? '' : 's'}</div>
-      <div class="row"><button class="btn sm" data-act="export" type="button">Exportar dados</button><button class="btn sm" data-act="import" type="button">Importar backup</button><button class="btn pri" data-act="newtask" type="button">+ Nova tarefa</button></div></div>
+      <div class="row"><button class="btn sm" data-act="export" type="button">Exportar dados</button><button class="btn sm" data-act="import" type="button">Importar backup</button><button class="btn pri" data-act="newtask" type="button">+ Dar ordem a Marcos</button></div></div>
     <div><h4 class="sec">Quem está fazendo agora</h4>${working.length ? `<div class="chips">${working.map(t => { const s = curStage(t); return `<button class="chip" type="button" data-open="${t.id}">${pName(s.resp)} · ${esc(s.label)} · ${esc(t.title.length > 34 ? t.title.slice(0, 33) + '…' : t.title)}</button>`; }).join('')}</div>` : '<p class="meta">Nenhuma etapa em andamento neste momento.</p>'}</div>
     <div class="chips" role="group" aria-label="Filtrar por status">${FILTERS.map(([k, l]) => `<button class="chip" type="button" data-tf="${k}" aria-pressed="${H.tFilter === k}">${l}<b>${filterTasks(k).length}</b></button>`).join('')}</div>
     <div class="row"><select id="tResp" aria-label="Responsável" style="max-width:320px"><option value="">Todos os responsáveis</option>${RESP_IDS.map(id => `<option value="${id}" ${H.tResp === id ? 'selected' : ''}>${person(id).name} — ${person(id).role}</option>`).join('')}</select>
@@ -1578,50 +1659,29 @@ function flowRows(order, checked){
 function openNewTask(prefill){
   if (!Store.ready){ toast('Aguarde: conectando ao armazenamento…'); return; }
   if (Store.readOnly){ toast('Você só tem permissão de leitura.'); return; }
-  openDlg('Nova tarefa', `<form id="fNew" style="display:grid;gap:12px">
-    <label class="f">Título<input type="text" id="nTitle" required maxlength="140" value="${esc(prefill ? prefill.slice(0, 140) : '')}" placeholder="Ex.: Campanha salário-maternidade — gestantes"></label>
-    <label class="f">Descrição<textarea class="f" id="nDesc" placeholder="Objetivo, público, observações da missão">${esc(prefill && prefill.length > 140 ? prefill : '')}</textarea></label>
+  openDlg('Dar ordem a Marcos', `<form id="fNew" style="display:grid;gap:12px">
+    <div class="note"><b>Você só precisa dizer o que quer.</b><br>Marcos escolhe o fluxo, distribui para a equipe e acompanha tudo automaticamente.</div>
+    <label class="f">O que você quer que o escritório produza?<textarea class="f" id="nDesc" required style="min-height:150px" placeholder="Ex.: Quero um criativo de salário-maternidade para gestantes de 7 a 9 meses, para Instagram.">${esc(prefill || '')}</textarea></label>
     <div class="grid2" style="gap:10px">
-      <label class="f">Tipo<select id="nType">${TEMPLATES.map(t => `<option value="${t.id}">${t.label}</option>`).join('')}</select></label>
-      <label class="f">Prioridade<select id="nPrio">${Object.entries(PRIORITIES).map(([k, [l]]) => `<option value="${k}" ${k === 'media' ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+      <label class="f">Prioridade<select id="nPrio">${Object.entries(PRIORITIES).map(([k,[l]]) => `<option value="${k}" ${k==='media'?'selected':''}>${l}</option>`).join('')}</select></label>
       <label class="f">Prazo<input type="date" id="nDue"></label>
-      <label class="f">Responsável inicial${respSelect('nFirst', defaultResp('pesquisa'))}</label>
     </div>
-    <div class="chips" role="group" aria-label="Fluxo"><button class="chip" type="button" data-flow="padrao" aria-pressed="true">Fluxo padrão (9 etapas)</button><button class="chip" type="button" data-flow="custom" aria-pressed="false">Fluxo personalizado</button></div>
-    <div id="nFlowStd"><ol class="stepper compact">${STAGE_ORDER.map((k, i) => `<li class="step bloqueada"><span class="num">${i + 1}</span><div class="sbody"><b>${STAGES[k].label}</b> <span class="meta">— ${esc(person(defaultResp(k)).name)}</span></div></li>`).join('')}</ol></div>
-    <div id="nFlowCustom" hidden><div class="note" style="margin:0 0 8px">Marque as etapas, ajuste a ordem com ↑ ↓ e escolha os responsáveis. A sugestão inicial vem do tipo escolhido.</div><div class="stages-edit" id="nStages"></div></div>
-    <label class="f">Observações (opcional)<textarea class="f" id="nNotes"></textarea></label>
-    <div class="row"><button class="btn pri" type="submit">CRIAR TAREFA</button><button class="btn" type="button" data-act="closedlg">Cancelar</button></div>
+    <div class="meta">O tipo e as etapas serão definidos automaticamente a partir do seu pedido. A publicação em Instagram/Facebook/TikTok <b>não será feita</b>.</div>
+    <div class="row"><button class="btn pri" type="submit">ENTREGAR A MARCOS</button><button class="btn" type="button" data-act="closedlg">Cancelar</button></div>
   </form>`);
-  let flow = 'padrao', firstTouched = false;
-  const fillCustom = () => { const tpl = TEMPLATES.find(t => t.id === $('#nType').value) || TEMPLATES[0]; const order = [...tpl.stages, ...STAGE_ORDER.filter(k => !tpl.stages.includes(k))]; $('#nStages').innerHTML = flowRows(order, tpl.stages); syncFirst(); };
-  const chosen = () => flow === 'padrao' ? STAGE_ORDER.map(k => ({key:k, resp: defaultResp(k)})) : [...$('#nStages').querySelectorAll('.se')].filter(r => r.querySelector('input').checked).map(r => ({key: r.dataset.key, resp: r.querySelector('select').value}));
-  const syncFirst = () => { if (firstTouched) return; const c = chosen(); if (c.length) $('#nFirst').value = c[0].resp; };
-  fillCustom();
-  $('#nFirst').addEventListener('change', () => { firstTouched = true; });
-  $('#nType').addEventListener('change', () => { fillCustom(); });
-  $('#nStages').addEventListener('change', syncFirst);
-  $('#nStages').addEventListener('click', e => {
-    const b = e.target.closest('[data-mv]'); if (!b) return;
-    const row = b.closest('.se'), box = $('#nStages');
-    if (b.dataset.mv === '-1' && row.previousElementSibling) box.insertBefore(row, row.previousElementSibling);
-    if (b.dataset.mv === '1' && row.nextElementSibling) box.insertBefore(row.nextElementSibling, row);
-    syncFirst();
-  });
-  $('#fNew').querySelectorAll('[data-flow]').forEach(b => b.addEventListener('click', () => {
-    flow = b.dataset.flow; $('#fNew').querySelectorAll('[data-flow]').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
-    $('#nFlowStd').hidden = flow !== 'padrao'; $('#nFlowCustom').hidden = flow === 'padrao'; syncFirst();
-  }));
-  $('#fNew').addEventListener('submit', e => {
+  $('#fNew').addEventListener('submit', async e => {
     e.preventDefault();
-    const title = $('#nTitle').value.trim(); if (!title) return;
-    const stages = chosen();
-    if (!stages.length){ toast('Escolha pelo menos uma etapa.'); return; }
-    stages[0].resp = $('#nFirst').value;
-    const t = createTask({title, desc: $('#nDesc').value.trim(), type: $('#nType').value, priority: $('#nPrio').value, due: $('#nDue').value, notes: $('#nNotes').value.trim(), stages});
-    closeDlg(); toast(`Tarefa ${t.code} criada. ${t.stages[0].label} aguardando ${person(t.stages[0].resp).name}.`); openHub('task', t.id);
+    const order = $('#nDesc').value.trim(); if (!order) return;
+    const type = inferOrderType(order), stages = autoStagesFor(type);
+    const title = order.length > 100 ? order.slice(0,97) + '…' : order;
+    const t = createTask({title, desc:order, type, priority:$('#nPrio').value, due:$('#nDue').value, notes:'Ordem recebida por Marcos. Execução automática ativada.', stages});
+    closeDlg();
+    toast(`Marcos recebeu a ordem ${t.code}. A equipe começou a trabalhar.`);
+    openHub('task', t.id);
+    runTaskAutomation(t.id);
   });
 }
+
 function openDeliver(taskId){
   if (!Store.ready){ toast('Aguarde: conectando ao armazenamento…'); return; }
   const tasks = Store.all('tasks').sort((a, b) => (isActive(b) - isActive(a)) || (b.createdAt - a.createdAt));
@@ -1759,17 +1819,8 @@ document.addEventListener('click', async e => {
     else if (a === 'start'){
       const t = Store.get('tasks', tid), s = t && curStage(t);
       if (!startStage(tid)) { toast('Não foi possível iniciar esta etapa.'); return; }
-      if (s && AI_AUTO_STAGES.has(s.key)) {
-        toast(`${s.label} iniciada. A Gemini está trabalhando…`);
-        executeAIStage(tid).then(r => {
-          if (r.ok) toast(`${s.label} concluída pela Gemini. Resultado guardado na Estante.`);
-          else toast(r.mensagem || 'A IA não concluiu a etapa.');
-          if (H.view) renderHub();
-          if (panelAgent) renderPanel();
-        }).catch(err => toast(`Erro na execução da IA: ${err.message || err}`));
-      } else {
-        toast(s ? `${s.label} iniciada por ${person(s.resp).name}.` : 'Etapa iniciada.');
-      }
+      toast(s ? `${s.label} iniciada manualmente.` : 'Etapa iniciada.');
+      if (s && AI_AUTO_STAGES.has(s.key)) executeAutoStage(tid).catch(err => toast(`Erro na execução: ${err.message || err}`));
     }
     else if (a === 'complete'){ const t = Store.get('tasks', tid), s = t && curStage(t), nf = Store.all('files').filter(f => f.taskId === tid && f.stageKey === s.key).length, nx = nextStage(t);
       openNoteDlg(s.key === 'revisao' ? 'Concluir revisão' : `Concluir ${s.label}`, `Observação da conclusão (opcional)${nf ? '' : ' — nenhum arquivo foi guardado nesta etapa'}`, 'Confirmar conclusão',
