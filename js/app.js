@@ -865,7 +865,7 @@ const STAGE_LOCKS = new Set();    // etapas (tarefa#índice#chave) com chamada �
 /* ---------- Saneamento das respostas da IA ---------- */
 /* Texto comum: remove BOM/caracteres invisíveis e, se a resposta inteira vier dentro de uma cerca Markdown, tira a cerca. */
 function cleanAIText(text){
-  let x = String(text || '').replace(/^﻿/, '').replace(/[​‌‍⁠]/g, '').replace(/\r\n?/g, '\n').trim();
+  let x = String(text || '').replace(/^\uFEFF/, '').replace(/[\u200B\u200C\u200D\u2060]/g, '').replace(/\r\n?/g, '\n').trim();
   const whole = /^```[ \t]*[\w+-]*[^\n]*\n([\s\S]*?)\n?```\s*$/.exec(x);
   if (whole) x = whole[1];
   else x = x.replace(/^```[ \t]*(?:svg|xml|html|text|markdown|md)?[ \t]*\n/i, '').replace(/\n?```\s*$/, '');
@@ -887,7 +887,7 @@ const SVG_NS = 'http://www.w3.org/2000/svg', XLINK_NS = 'http://www.w3.org/1999/
 const SVG_MAX_CHARS = 2000000;
 /* Isola UM elemento <svg> raiz (com seus <svg> aninhados) de uma resposta que pode ter Markdown, texto antes/depois ou vários SVGs. */
 function extractSVG(raw){
-  let x = String(raw || '').replace(/^﻿/, '').replace(/[​‌‍⁠]/g, '').replace(/\r\n?/g, '\n');
+  let x = String(raw || '').replace(/^\uFEFF/, '').replace(/[\u200B\u200C\u200D\u2060]/g, '').replace(/\r\n?/g, '\n');
   const fenced = [...x.matchAll(/```[ \t]*[\w+-]*[^\n]*\n([\s\S]*?)```/g)].map(m => m[1]).find(c => /<svg[\s>]/i.test(c));
   if (fenced) x = fenced;
   x = x.replace(/```[ \t]*[\w+-]*/g, '');           // cercas soltas (ex.: resposta truncada sem a cerca final)
