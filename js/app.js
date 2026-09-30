@@ -849,12 +849,83 @@ function createTask({title, desc, type, priority, due, notes, stages}){
   notify(`Nova tarefa atribuída a ${person(t.stages[0].resp).name} (${t.stages[0].label}): ${t.title}`, 'atribuicao', t.id);
   return t;
 }
+const IA_CAN_CONCLUIR = new Set(['copy','roteiro']);
+
+const IA_STAGE_INSTRUCTIONS = {
+  pesquisa: 'Analise a demanda e produza uma pesquisa preparatória objetiva para a tarefa. Use apenas conhecimento que você possa sustentar e os dados fornecidos. Não invente fontes, números ou pesquisas externas. Se a tarefa exigir dados atuais ou fontes externas, deixe isso explicitamente indicado no resultado.',
+  copy: 'Produza a copy solicitada para a tarefa. Entregue texto pronto para uso, adequado ao tipo de conteúdo e ao público descrito.',
+  roteiro: 'Produza o roteiro solicitado, com estrutura clara, falas/narração e indicações necessárias para gravação. Não invente dados factuais que não estejam disponíveis.',
+  criativo: 'Crie o briefing completo do criativo: conceito, composição, texto na arte quando aplicável, direção visual, formato e instruções de produção. Não diga que uma imagem ou vídeo foi criado se isso não aconteceu.',
+  revisao: 'Revise o material disponível no contexto da tarefa. Aponte problemas e entregue uma versão corrigida quando houver texto suficiente para isso. Não aprove como correto aquilo que não puder ser verificado.',
+  finalizacao: 'Finalize o material disponível, organizando-o em uma versão pronta para entrega. Não afirme que um arquivo externo foi gerado ou enviado se isso não aconteceu.',
+  publicacao: 'Prepare o pacote de publicação: legenda, título quando aplicável, chamada, hashtags e checklist de publicação. NÃO publique em nenhuma rede social e não diga que publicou.',
+  analise: 'Analise os dados fornecidos na tarefa. Se não houver métricas suficientes, informe exatamente quais dados faltam e não invente resultados.',
+  arquivamento: 'Prepare um resumo de arquivamento da tarefa, identificando o que deve ser guardado e os dados essenciais. O armazenamento local será feito pelo sistema quando houver arquivo real.'
+};
+
+function renderAIResult(t){
+  const results = t.aiResults || [];
+  const result = results.length ? results[results.length - 1] : null;
+  if (!result) return '';
+  return `<div class="callout" style="margin-top:10px"><b>Último resultado da IA — ${esc(result.label || result.key || 'Etapa')}</b><div style="white-space:pre-wrap;margin-top:6px">${esc(result.text || result.mensagem || '')}</div>${result.executadoEm ? `<div class="meta" style="margin-top:6px">Executado em ${fmtFull(result.executadoEm)} · ${esc(result.model || 'IA')}</div>` : ''}</div>`;
+}
+
+async function executarEtapaComIA(id){
+  const t = T(id); if (!t) return {ok:false, mensagem:'Tarefa não encontrada.'};
+  const s = t.stages[t.cur];
+  if (!s || s.status !== 'andamento' || t.hold) return {ok:false, mensagem:'A etapa não está disponível para execução.'};
+  if (!window.EVIntegracoes || !window.EVIntegracoes.ia || !window.EVIntegracoes.ia.conectada()) {
+    return {ok:false, mensagem:'A IA não está conectada.'};
+  }
+
+  s.aiStatus = 'executando';
+  hist(t, `${person(s.resp).name} enviou ${s.label} para execução da IA.`, 'ia');
+  Store.put('tasks', t);
+  notify(`IA executando ${s.label}: ${t.title}`, 'inicio', t.id);
+
+  const resultado = await window.EVIntegracoes.ia.executar({
+    agente: person(s.resp).name,
+    etapa: s.label,
+    tarefa: t,
+    instrucao: IA_STAGE_INSTRUCTIONS[s.key] || 'Execute a etapa de forma objetiva e sem inventar informações.'
+  });
+
+  const atualizado = T(id); if (!atualizado) return {ok:false, mensagem:'Tarefa não encontrada após a execução.'};
+  const atual = atualizado.stages[atualizado.cur];
+  if (!atual || atual.key !== s.key || atual.status !== 'andamento') return {ok:false, mensagem:'A tarefa mudou enquanto a IA trabalhava.'};
+
+  if (!resultado.ok) {
+    atual.aiStatus = 'erro';
+    atual.aiResult = {mensagem: resultado.mensagem || 'A IA não conseguiu executar a etapa.'};
+    hist(atualizado, `Falha na execução da IA em ${atual.label}: ${resultado.mensagem || 'erro não especificado'}.`, 'problema');
+    Store.put('tasks', atualizado);
+    notify(`Problema na IA em ${atual.label}: ${atualizado.title}`, 'problema', atualizado.id);
+    return resultado;
+  }
+
+  atual.aiStatus = IA_CAN_CONCLUIR.has(atual.key) ? 'concluida' : 'resultado_pronto';
+  atual.aiResult = {text: resultado.text || '', model: resultado.model, executadoEm: resultado.executadoEm};
+  atualizado.aiResults = atualizado.aiResults || [];
+  atualizado.aiResults.push({key: atual.key, label: atual.label, text: resultado.text || '', model: resultado.model, executadoEm: resultado.executadoEm});
+  if (IA_CAN_CONCLUIR.has(atual.key)) {
+    hist(atualizado, `IA concluiu a execução de ${atual.label}; resultado salvo na tarefa.`, 'ia');
+    Store.put('tasks', atualizado);
+    completeStage(id, 'Resultado produzido pela IA e salvo na tarefa.');
+    return {ok:true, concluida:true, text: resultado.text || ''};
+  }
+  hist(atualizado, `IA produziu um resultado para ${atual.label}; a etapa permanece em andamento porque esta ação ainda depende de execução real/integrada.`, 'ia');
+  Store.put('tasks', atualizado);
+  notify(`Resultado da IA pronto, mas ${atual.label} ainda depende de ação real: ${atualizado.title}`, 'problema', atualizado.id);
+  return {ok:true, concluida:false, text: resultado.text || '', mensagem:'Resultado produzido e salvo. A etapa não foi marcada como concluída porque esta ação ainda não está integrada.'};
+}
+
 function startStage(id){
-  const t = T(id); if (!t) return; const s = t.stages[t.cur]; if (!s || s.status !== 'aguardando' || t.hold) return;
-  s.status = 'andamento'; s.startedAt = now(); if (!t.startedAt) t.startedAt = s.startedAt;
+  const t = T(id); if (!t) return false; const s = t.stages[t.cur]; if (!s || s.status !== 'aguardando' || t.hold) return false;
+  s.status = 'andamento'; s.startedAt = now(); s.aiStatus = 'aguardando'; if (!t.startedAt) t.startedAt = s.startedAt;
   hist(t, `${person(s.resp).name} iniciou ${s.label}.`, 'inicio'); Store.put('tasks', t);
   if (s.key === 'revisao') notify(`Tarefa em revisão com ${person(s.resp).name}: ${t.title}`, 'revisao', t.id);
   else notify(`${STAGES[s.key].started} por ${person(s.resp).name}: ${t.title}`, 'inicio', t.id);
+  return true;
 }
 function completeStage(id, note){
   const t = T(id); if (!t) return; const s = t.stages[t.cur]; if (!s || s.status !== 'andamento' || t.hold) return;
@@ -1396,6 +1467,7 @@ function hubTask(){
   return `<div class="row" style="justify-content:space-between"><button class="btn sm" data-act="back" type="button">← Voltar</button><div class="row" style="gap:6px">${prioPill(t)}${latePill(t)}${statusPillT(t)}<span class="mono">${Math.round(p*100)}%</span></div></div>
     <div class="bar ${p >= 1 ? 'ok' : ''}"><i style="width:${Math.round(p*100)}%"></i></div>
     <div class="row">${stageActions(t)}${holdBtns}<button class="btn sm" data-act="deliver" data-t="${t.id}" type="button">Guardar arquivo</button><button class="btn sm" data-act="taskreport" data-t="${t.id}" type="button">Gerar relatório da tarefa (.txt)</button></div>
+    ${renderAIResult(t)}
     ${t.hold ? `<div class="warnbox"><b>${t.hold === 'problema' ? 'Problema registrado' : 'Tarefa pausada'}</b>${t.hold === 'problema' ? ' por ' + esc(person(t.holdBy || 'voce').name) : ''}${t.holdNote ? ': ' + esc(t.holdNote) : ''}</div>` : ''}
     ${pub}
     <div class="grid2">
@@ -1697,7 +1769,17 @@ document.addEventListener('click', async e => {
     if (!Store.ready && !safeAct){ toast('Aguarde: conectando ao armazenamento…'); return; }
     if (Store.readOnly && !safeAct){ toast('Você só tem permissão de leitura.'); return; }
     if (a === 'newtask') openNewTask();
-    else if (a === 'start'){ const t = Store.get('tasks', tid), s = t && curStage(t); startStage(tid); toast(s ? `${s.label} iniciada por ${person(s.resp).name}.` : 'Etapa iniciada.'); }
+    else if (a === 'start'){
+      const t = Store.get('tasks', tid), s = t && curStage(t);
+      if (!startStage(tid)){ toast('Não foi possível iniciar a etapa.'); return; }
+      toast(s ? `${s.label} iniciada por ${person(s.resp).name}. A IA começou a trabalhar.` : 'Etapa iniciada.');
+      if (H.view) renderHub();
+      executarEtapaComIA(tid).then(r => {
+        if (r.ok) toast('Etapa concluída pela IA e resultado salvo.');
+        else toast(r.mensagem || 'A IA não conseguiu concluir a etapa.');
+        if (H.view) renderHub();
+      }).catch(err => { toast(err && err.message ? err.message : 'Erro inesperado na execução da IA.'); if (H.view) renderHub(); });
+    }
     else if (a === 'complete'){ const t = Store.get('tasks', tid), s = t && curStage(t), nf = Store.all('files').filter(f => f.taskId === tid && f.stageKey === s.key).length, nx = nextStage(t);
       openNoteDlg(s.key === 'revisao' ? 'Concluir revisão' : `Concluir ${s.label}`, `Observação da conclusão (opcional)${nf ? '' : ' — nenhum arquivo foi guardado nesta etapa'}`, 'Confirmar conclusão',
         note => { completeStage(tid, note); toast(nx ? `${STAGES[s.key].done}. ${nx.label} aguardando ${person(nx.resp).name}.` : 'Tarefa concluída.'); },
