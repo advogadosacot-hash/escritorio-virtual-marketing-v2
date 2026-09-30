@@ -869,7 +869,10 @@ function aiInstructionForStage(stageKey){
 
 async function executeAIStage(id){
   const t = T(id); if (!t) return {ok:false, mensagem:'Tarefa não encontrada.'};
-  const s = t.stages[t.cur]; if (!s || !AI_AUTO_STAGES.has(s.key) || s.status !== 'andamento' || t.hold) return {ok:false, mensagem:'Esta etapa não está configurada para execução automática pela IA.'};
+  const s = t.stages[t.cur];
+  /* BLOQUEIO EXPLÍCITO: Pesquisa nunca chama a Gemini. Somente Copy e Roteiro. */
+  if (!s || (s.key !== 'copy' && s.key !== 'roteiro')) return {ok:false, mensagem:'A IA automática está disponível somente para Copy e Roteiro.'};
+  if (s.status !== 'andamento' || t.hold) return {ok:false, mensagem:'Esta etapa não está disponível para execução automática pela IA.'};
   const ia = window.EVIntegracoes && window.EVIntegracoes.ia;
   if (!ia || typeof ia.executar !== 'function' || !ia.conectada()) return {ok:false, mensagem:'A IA não está conectada ao escritório.'};
 
