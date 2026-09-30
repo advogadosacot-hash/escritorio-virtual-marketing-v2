@@ -923,10 +923,66 @@ function resultFileSpec(stageKey, resultText, task){
   return {name:`${prefix}_${safe}_${new Date().toISOString().slice(0,10)}.${ext}`, mime, blob:new Blob([resultText], {type:mime})};
 }
 
+async function executeLocalResearchStage(id){
+  const t = T(id); if (!t) return {ok:false, mensagem:'Tarefa não encontrada.'};
+  const s = t.stages[t.cur];
+  if (!s || s.key !== 'pesquisa' || s.status !== 'andamento' || t.hold) return {ok:false, mensagem:'Pesquisa não está disponível.'};
+
+  const pedido = (t.desc || t.title || '').trim();
+  const tipo = typeLabel(t.type || 'outro');
+  const texto = [
+    `PESQUISA ESTRATÉGICA — ${t.title}`,
+    '',
+    `Pedido original: ${pedido || 'não informado'}`,
+    `Tipo de trabalho: ${tipo}`,
+    '',
+    'RESPONSÁVEL: Lívia — Pesquisadora',
+    '',
+    '1. OBJETIVO',
+    `Identificar o objetivo principal do material a partir do pedido: ${pedido || t.title}.`,
+    '',
+    '2. PÚBLICO-ALVO',
+    'O público será definido a partir das pessoas, situação e benefício mencionados no pedido. Evitar acrescentar características que não tenham sido informadas.',
+    '',
+    '3. MENSAGEM CENTRAL',
+    `A comunicação deve responder diretamente ao pedido do proprietário e destacar a informação principal que ele deseja transmitir: ${pedido || t.title}.`,
+    '',
+    '4. DIRETRIZES PARA RAFAEL E BIA',
+    '- Usar linguagem clara, direta e adequada ao público indicado no pedido.',
+    '- Não inventar valores, estatísticas, leis, fontes, resultados ou promessas.',
+    '- Transformar somente as informações disponíveis em conteúdo de marketing.',
+    '- Se houver necessidade de confirmação jurídica ou factual externa, sinalizar para verificação antes da publicação.',
+    '',
+    '5. PONTOS QUE PRECISAM DE VERIFICAÇÃO EXTERNA',
+    '- Dados atuais, números, estatísticas, notícias, legislação ou informações que não estejam no pedido/contexto.',
+    '- Qualquer afirmação que dependa de pesquisa na internet.',
+    '',
+    '6. CONCLUSÃO DA PESQUISA',
+    `A pesquisa inicial foi estruturada por Lívia com base exclusivamente no pedido recebido. A etapa não realizou navegação externa nem apresentou informações externas como se fossem verificadas.`,
+  ].join('\n');
+
+  hist(t, 'Lívia executou a pesquisa estratégica automaticamente, sem alegar navegação externa.', 'ia_inicio', 'automacao');
+  await Store.put('tasks', t);
+  notify(`Lívia está trabalhando em Pesquisa: ${t.title}`, 'ia', t.id);
+  const spec = resultFileSpec('pesquisa', texto, t);
+  await attachFiles(t.id, t.cur, [{blob:spec.blob,name:spec.name}], STAGES.pesquisa.cat, s.resp, 'pesquisa_local_automatica');
+  const after = T(id);
+  if (after && after.stages[after.cur] && after.stages[after.cur].status === 'andamento') {
+    completeStage(id, `Pesquisa estratégica produzida automaticamente e guardada na Estante como ${spec.name}.`);
+    const done = T(id);
+    hist(done, 'Lívia entregou a Pesquisa automaticamente.', 'ia_conclusao', 'automacao');
+    await Store.put('tasks', done);
+    notify(`Pesquisa concluída por Lívia: ${done.title}`, 'ia_conclusao', done.id);
+  }
+  renderHUD(); syncAgents(); dirty = true;
+  return {ok:true,text:texto,fileName:spec.name};
+}
+
 async function executeAutoStage(id){
   const t = T(id); if (!t) return {ok:false, mensagem:'Tarefa não encontrada.'};
   const s = t.stages[t.cur];
   if (!s || !AI_AUTO_STAGES.has(s.key) || s.status !== 'andamento' || t.hold) return {ok:false, mensagem:'Etapa não disponível para execução automática.'};
+  if (s.key === 'pesquisa') return executeLocalResearchStage(id);
   const ia = window.EVIntegracoes && window.EVIntegracoes.ia;
   if (!ia || typeof ia.executar !== 'function' || !ia.conectada()) return {ok:false, mensagem:'A IA não está conectada ao escritório.'};
 
